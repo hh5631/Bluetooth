@@ -82,7 +82,7 @@ private:
     
     // 当前操作状态
     QBluetoothDeviceInfo m_currentDevice;
-    QString m_currentPin = nullptr;
+    QString m_currentPin;
     QTimer *m_pairingTimer=nullptr;
     QBluetoothAddress m_currentPairingAddress;
     QTimer *m_pinDisplayTimer=nullptr;  // PIN码显示超时定时器

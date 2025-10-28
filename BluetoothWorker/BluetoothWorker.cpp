@@ -67,6 +67,17 @@ void BluetoothWorker::initializeBluetooth()
         m_pairingTimer->setInterval(20000); // 10秒超时
     }
 
+    // 创建PIN码显示超时定时器
+    if (!m_pinDisplayTimer) {
+        m_pinDisplayTimer = new QTimer(this);
+        m_pinDisplayTimer->setSingleShot(true);
+    }
+
+    // 创建蓝牙Socket
+    if (!m_socket) {
+        m_socket = new QBluetoothSocket(QBluetoothServiceInfo::RfcommProtocol, this);
+    }
+
     // 设置信号连接
     setupConnections();
 
@@ -179,37 +190,63 @@ void BluetoothWorker::connectDevice(const QBluetoothDeviceInfo &device, const QS
         emit errorOccurred("蓝牙设备不可用");
         return;
     }
-    
+
+    //保存当前要连接的设备信息
     m_currentDevice = device;
-//        m_currentPin = pin;
+    
+    QString deviceName = device.name().isEmpty() ? device.address().toString() : device.name();
+    qDebug() << "BluetoothWorker: 开始连接设备:" << deviceName;
     
     // 检查设备是否已配对
     QBluetoothLocalDevice::Pairing pairingStatus = m_localDevice->pairingStatus(device.address());
     
-    if (pairingStatus != QBluetoothLocalDevice::Paired) {
+    qDebug() << "当前配对状态:" << pairingStatus 
+             << "(0=Unpaired, 1=Paired, 2=AuthorizedPaired)";
+    
+    // 检查是否已配对（Paired 或 AuthorizedPaired 都算已配对）
+    if (pairingStatus == QBluetoothLocalDevice::Paired || 
+        pairingStatus == QBluetoothLocalDevice::AuthorizedPaired) {
+        // 已配对，延迟后建立连接
+        qDebug() << "BluetoothWorker: 设备已配对，准备建立连接";
+        LOG_INFO("OperateLog", "BluetoothWorker: 设备已配对，准备建立连接");
+        emit statusMessage("设备已配对，正在连接...");
+
+        // ⭐ 添加延迟，给嵌入式设备时间准备
+        QTimer::singleShot(1000, this, [this]() {
+            establishSocketConnection();
+        });
+        
+    } else {
         // 需要配对
         qDebug() << "BluetoothWorker: 设备未配对，开始配对过程";
         LOG_INFO("OperateLog", "BluetoothWorker: 设备未配对，开始配对过程");
         
+        // 发出配对开始信号
+        emit pairingStarted(deviceName);
+        emit statusMessage("正在配对设备: " + deviceName);
+        
         // 启动配对超时定时器
-        // m_pairingTimer->start();
+        if (m_pairingTimer) {
+            m_pairingTimer->start();
+            qDebug() << "配对超时定时器已启动，超时时间:" << m_pairingTimer->interval() << "ms";
+        }
         
         // 请求配对
-        qDebug()<<"device.address()"<<device.address();
-        qDebug()<<"QBluetoothLocalDevice::Paired"<< QBluetoothLocalDevice::Paired;
+        qDebug() << "请求配对 - 设备地址:" << device.address();
         m_localDevice->requestPairing(device.address(), QBluetoothLocalDevice::Paired);
-        
-    } else {
- // 已配对，直接连接
-        qDebug() << "BluetoothWorker: 设备已配对，开始建立连接";
-        LOG_INFO("OperateLog", "BluetoothWorker: 设备已配对，开始建立连接");
-
-        establishSocketConnection();
     }   
 }
 void BluetoothWorker::establishSocketConnection()
 {
-    qDebug()<<"establishSocketConnection";
+    qDebug() << "establishSocketConnection - 当前设备:" << m_currentDevice.name();
+    
+    QString deviceName = m_currentDevice.name().isEmpty() ? 
+                        m_currentDevice.address().toString() : m_currentDevice.name();
+    
+    // 发出连接开始信号
+    emit connectionStarted(deviceName);
+    emit statusMessage("正在连接到 " + deviceName + "...");
+    
     // 清理旧的服务发现代理
     if (m_sDiscoveryAgent) 
     {
@@ -218,74 +255,53 @@ void BluetoothWorker::establishSocketConnection()
         m_sDiscoveryAgent = nullptr;
     }
 
-     // 创建新的服务发现代理，传入目标设备的MAC地址
-     m_sDiscoveryAgent= new QBluetoothServiceDiscoveryAgent(m_currentDevice.address(), this);
-     qDebug()<<"m_sDiscoveryAgent"<<m_sDiscoveryAgent;
-        // 连接信号
-     connect(m_sDiscoveryAgent, &QBluetoothServiceDiscoveryAgent::serviceDiscovered,
-            this, &BluetoothWorker::onServiceDiscovered);
-     connect(m_sDiscoveryAgent, &QBluetoothServiceDiscoveryAgent::finished,
-             this, &BluetoothWorker::onServiceDiscoveryFinished);
-     connect(m_sDiscoveryAgent, QOverload<QBluetoothServiceDiscoveryAgent::Error>::of(&QBluetoothServiceDiscoveryAgent::error),
-                    this, &BluetoothWorker::onServiceDiscoveryError);
+    // 创建新的服务发现代理，传入目标设备的MAC地址
+    m_sDiscoveryAgent = new QBluetoothServiceDiscoveryAgent(m_currentDevice.address(), this);
+    qDebug() << "创建服务发现代理:" << m_sDiscoveryAgent;
     
-    if (!m_socket) {
-        m_socket = new QBluetoothSocket(QBluetoothServiceInfo::RfcommProtocol, this);
-        
-        qDebug()<<"m_socket"<<m_socket;
-    }
-    connect(m_socket, &QBluetoothSocket::connected,
-        this, [this]() {
-            QString deviceName = m_currentDevice.name().isEmpty() ?
-                               m_currentDevice.address().toString() : m_currentDevice.name();
-            qDebug() << "BluetoothWorker: Socket连接成功:" << deviceName;
-            LOG_INFO("OperateLog", "BluetoothWorker: Socket连接成功: " + deviceName.toStdString());
-            emit connectionSuccess(deviceName);
-        });
-    connect(m_socket, &QBluetoothSocket::disconnected,
-            this, [this]() {
-                qDebug() << "BluetoothWorker: Socket连接断开";
-                LOG_INFO("OperateLog", "BluetoothWorker: Socket连接断开");
-                emit statusMessage("设备连接已断开");
-            });
-    connect(m_socket, QOverload<QBluetoothSocket::SocketError>::of(&QBluetoothSocket::error),
-            this, [this](QBluetoothSocket::SocketError error) {
-                QString errorString = QString("Socket连接错误: %1").arg(error);
-                qDebug() << "BluetoothWorker:" << errorString;
-                LOG_ERROR("OperateLog", errorString.toStdString());
-                emit connectionFailed(errorString);
-            });
-   if (m_socket->state() != QBluetoothSocket::UnconnectedState)
+    // 连接信号
+    connect(m_sDiscoveryAgent, &QBluetoothServiceDiscoveryAgent::serviceDiscovered,
+           this, &BluetoothWorker::onServiceDiscovered);
+    connect(m_sDiscoveryAgent, &QBluetoothServiceDiscoveryAgent::finished,
+            this, &BluetoothWorker::onServiceDiscoveryFinished);
+    connect(m_sDiscoveryAgent, QOverload<QBluetoothServiceDiscoveryAgent::Error>::of(&QBluetoothServiceDiscoveryAgent::error),
+           this, &BluetoothWorker::onServiceDiscoveryError);
+    
+    // 检查Socket状态
+    if (m_socket->state() != QBluetoothSocket::UnconnectedState)
     {
-       // Socket 不在未连接状态，需要先断开
-       qDebug() << "BluetoothWorker: Socket 不在未连接状态，先断开";
+        // Socket 不在未连接状态，需要先断开
+        qDebug() << "BluetoothWorker: Socket 不在未连接状态(" << m_socket->state() << ")，先断开";
         
-       // 连接断开完成信号，然后重新开始服务发现
-       auto disconnectConn = std::make_shared<QMetaObject::Connection>();
-       *disconnectConn = connect(m_socket, &QBluetoothSocket::disconnected,
-               this, [this, disconnectConn]() {
-                   qDebug() << "BluetoothWorker: Socket 已断开，重新开始服务发现";
-                   disconnect(*disconnectConn);                   
-                   // 重置服务信息
-                   m_service = QBluetoothServiceInfo();
-                   
-                   // 开始服务发现
-                   if (m_sDiscoveryAgent) {
-                       m_sDiscoveryAgent->start();
-                   }
-               });
-       
-       m_socket->disconnectFromService();
-       return; // 等待断开完成后再继续
+        // 连接断开完成信号，然后重新开始服务发现
+        auto disconnectConn = std::make_shared<QMetaObject::Connection>();
+        *disconnectConn = connect(m_socket, &QBluetoothSocket::disconnected,
+                this, [this, disconnectConn]() {
+                    qDebug() << "BluetoothWorker: Socket 已断开，重新开始服务发现";
+                    disconnect(*disconnectConn);                   
+                    // 重置服务信息
+                    m_service = QBluetoothServiceInfo();
+                    
+                    // 开始服务发现
+                    if (m_sDiscoveryAgent) {
+                        qDebug() << "开始服务发现...";
+                        m_sDiscoveryAgent->start();
+                    }
+                });
+        
+        m_socket->disconnectFromService();
+        return; // 等待断开完成后再继续
     }
     else
     {
-        qDebug()<<"m_socket为其他状态"<<m_socket->state();
+        qDebug() << "m_socket状态正常(UnconnectedState)，直接开始服务发现";
     }
+    
     // 重置服务信息
     m_service = QBluetoothServiceInfo();
 
-    // 发现服务
+    // 开始服务发现
+    qDebug() << "开始服务发现...";
     m_sDiscoveryAgent->start();
 }
 
@@ -301,6 +317,7 @@ void BluetoothWorker::disconnectDevice()
 
 void BluetoothWorker::setupConnections()
 {
+    // 设备发现代理的信号连接
     if (m_discoveryAgent) 
     {
         connect(m_discoveryAgent, &QBluetoothDeviceDiscoveryAgent::deviceDiscovered,
@@ -312,6 +329,7 @@ void BluetoothWorker::setupConnections()
             this, &BluetoothWorker::onScanError);
     }
 
+    // 本地蓝牙设备的信号连接
     if (m_localDevice) 
     {
         connect(m_localDevice, &QBluetoothLocalDevice::pairingFinished,
@@ -322,21 +340,46 @@ void BluetoothWorker::setupConnections()
                 this, &BluetoothWorker::onDisplayConfirmation);
     }
 
+    // 配对超时定时器的信号连接
     if (m_pairingTimer) 
     {
         connect(m_pairingTimer, &QTimer::timeout,
                 this, &BluetoothWorker::onPairingTimeout);
     }
 
-    if (!m_pinDisplayTimer) {
-        m_pinDisplayTimer = new QTimer(this);
-        m_pinDisplayTimer->setSingleShot(true);
+    // PIN码显示超时定时器的信号连接
+    if (m_pinDisplayTimer) {
         connect(m_pinDisplayTimer, &QTimer::timeout, this, [this]() {
             qDebug() << "BluetoothWorker: PIN码确认超时";
             LOG_ERROR("OperateLog", "BluetoothWorker: PIN码确认超时");
             emit pairingFinished(false, m_currentDevice.name());
             emit connectionFailed("PIN码确认超时");
         });
+    }
+
+    // Socket的信号连接（只连接一次）
+    if (m_socket) {
+        connect(m_socket, &QBluetoothSocket::connected,
+            this, [this]() {
+                QString deviceName = m_currentDevice.name().isEmpty() ?
+                                    m_currentDevice.address().toString() : m_currentDevice.name();
+                qDebug() << "BluetoothWorker: Socket连接成功:" << deviceName;
+                LOG_INFO("OperateLog", "BluetoothWorker: Socket连接成功: " + deviceName.toStdString());
+                emit connectionSuccess(deviceName);
+            });
+        connect(m_socket, &QBluetoothSocket::disconnected,
+                this, [this]() {
+                    qDebug() << "BluetoothWorker: Socket连接断开";
+                    LOG_INFO("OperateLog", "BluetoothWorker: Socket连接断开");
+                    emit statusMessage("设备连接已断开");
+                });
+        connect(m_socket, QOverload<QBluetoothSocket::SocketError>::of(&QBluetoothSocket::error),
+                this, [this](QBluetoothSocket::SocketError error) {
+                    QString errorString = QString("Socket连接错误: %1").arg(error);
+                    qDebug() << "BluetoothWorker:" << errorString;
+                    LOG_ERROR("OperateLog", errorString.toStdString());
+                    emit connectionFailed(errorString);
+                });
     }
 }
 
@@ -402,21 +445,32 @@ void BluetoothWorker::onScanError(QBluetoothDeviceDiscoveryAgent::Error error)
 void BluetoothWorker::onPairingFinished(const QBluetoothAddress &address, QBluetoothLocalDevice::Pairing pairing)
 {
     // 停止超时定时器
-    if (m_pairingTimer->isActive()) {
+    if (m_pairingTimer && m_pairingTimer->isActive()) {
         m_pairingTimer->stop();
     }
 
     QString deviceName = m_currentDevice.name().isEmpty() ? address.toString() : m_currentDevice.name();
     
-    if (pairing == QBluetoothLocalDevice::Paired) {
-        qDebug() << "BluetoothWorker: 配对成功:" << deviceName;
+    // 添加详细的配对状态日志
+    qDebug() << "配对完成回调 - 地址:" << address << "状态:" << pairing;
+    
+    // 检查所有成功的配对状态（Paired=1 或 AuthorizedPaired=2）
+    if (pairing == QBluetoothLocalDevice::Paired || pairing == QBluetoothLocalDevice::AuthorizedPaired) {
+        qDebug() << "BluetoothWorker: 配对成功:" << deviceName << "状态:" << pairing;
         LOG_INFO("OperateLog", "BluetoothWorker: 配对成功: " + deviceName.toStdString());
         
-//        emit pairingFinished(true, deviceName);
-        establishSocketConnection();
+        // 发出配对成功信号
+        emit pairingFinished(true, deviceName);
+        emit statusMessage("配对成功，正在建立连接...");
+        
+        // ⭐ 关键修复：延迟2秒后再进行连接，给设备时间准备服务
+        QTimer::singleShot(2000, this, [this, deviceName]() {
+            qDebug() << "BluetoothWorker: 延迟后开始建立连接到:" << deviceName;
+            establishSocketConnection();
+        });
         
     } else {
-        qDebug() << "BluetoothWorker: 配对失败:" << deviceName;
+        qDebug() << "BluetoothWorker: 配对失败:" << deviceName << "状态:" << pairing;
         LOG_ERROR("OperateLog", "BluetoothWorker: 配对失败: " + deviceName.toStdString());
         
         emit pairingFinished(false, deviceName);
@@ -456,13 +510,12 @@ void BluetoothWorker::onDisplayPinCode(const QBluetoothAddress &address, QString
     LOG_INFO("OperateLog", "BluetoothWorker: 显示PIN码: " + pin.toStdString() + 
              " 设备: " + deviceName.toStdString());
     
-    // 启动PIN码显示超时定时器（30秒）
-    if (!m_pinDisplayTimer) {
-        m_pinDisplayTimer = new QTimer(this);
-        m_pinDisplayTimer->setSingleShot(true);
-    }
-    m_pinDisplayTimer->start(60000); // 30秒超时
-    
+   // 启动PIN码显示超时定时器（60秒）
+   if (m_pinDisplayTimer) 
+   {
+        m_pinDisplayTimer->start(60000); // 60秒超时
+   }
+
     // 发送信号通知UI显示PIN码
     emit pinCodeDisplayed(deviceName, pin);
 }
@@ -487,32 +540,51 @@ void BluetoothWorker::onDisplayConfirmation(const QBluetoothAddress &address, QS
     
     // 发送信号通知UI请求用户确认
     emit confirmationRequested(deviceName, pin);
+    // 【临时测试】自动确认PIN码（仅用于调试）
+    QTimer::singleShot(100, this, [this]() {
+        qDebug() << "自动确认PIN码（测试模式）";
+        if (m_localDevice) {
+            m_localDevice->pairingConfirmation(true);
+        }
+    });
 }
 
 void BluetoothWorker::onServiceDiscovered(const QBluetoothServiceInfo &service)
 {
-    qDebug()<<"发现服务-uuid"<<service.serviceUuid();
-    
-    // 如果已经找到有效服务，跳过
-    if (m_service.isValid()) {
+    qDebug() << "发现服务 - UUID:" << service.serviceUuid() << "名称:" << service.serviceName();
+
+    // 如果已经找到SPP服务，跳过其他服务
+    if (m_service.isValid() && m_service.serviceUuid() == QBluetoothUuid(QBluetoothUuid::SerialPort)) {
         return;
     }
-    
+
     // 优先选择 SPP 服务 (Serial Port Profile)
     QBluetoothUuid sppUuid(QBluetoothUuid::SerialPort);
     if (service.serviceUuid() == sppUuid) {
         m_service = service;
-        qDebug()<<"选择 SPP 服务";
-    } else if (!m_service.isValid()) {
-        // 如果没有找到 SPP，使用第一个可用的服务
+        qDebug() << "✓ 选择 SPP 服务";
+        return;
+    }
+
+    // 检查服务是否包含RFCOMM协议
+    if (service.socketProtocol() == QBluetoothServiceInfo::RfcommProtocol) {
+        if (!m_service.isValid()) {
+            m_service = service;
+            qDebug() << "✓ 选择 RFCOMM 服务:" << service.serviceUuid();
+        }
+        return;
+    }
+
+    // 如果还没有找到任何服务，保存第一个发现的服务
+    if (!m_service.isValid()) {
         m_service = service;
-        qDebug()<<"使用服务："<<service.serviceUuid();
+        qDebug() << "✓ 使用第一个发现的服务:" << service.serviceUuid();
     }
 }
 
 void BluetoothWorker::onServiceDiscoveryFinished()
 {
-    qDebug()<<"onServiceDiscoveryFinished";
+    qDebug() << "onServiceDiscoveryFinished - 服务发现完成";
     
     if (!m_service.isValid()) {
         qDebug() << "BluetoothWorker: 未找到有效的蓝牙服务";
@@ -521,11 +593,25 @@ void BluetoothWorker::onServiceDiscoveryFinished()
         return;
     }
     
-    if (m_socket) {
-        m_socket->connectToService(m_currentDevice.address(), m_service.serviceUuid());
-    } else {
+    if (!m_socket) {
         emit connectionFailed("Socket未初始化");
+        return;
     }
+    
+    qDebug() << "准备连接到服务 - UUID:" << m_service.serviceUuid()
+             << "设备:" << m_currentDevice.address();
+    
+    // ⭐ 优先使用完整的服务信息连接（包含端口号等详细信息）
+    if (m_service.isValid() && m_service.socketProtocol() == QBluetoothServiceInfo::RfcommProtocol) {
+        qDebug() << "使用完整服务信息连接";
+        m_socket->connectToService(m_service, QIODevice::ReadWrite);
+    } else {
+        // 备用方案：使用地址+UUID连接
+        qDebug() << "使用地址+UUID连接";
+        m_socket->connectToService(m_currentDevice.address(), m_service.serviceUuid(), QIODevice::ReadWrite);
+    }
+    
+    qDebug() << "已发起Socket连接请求，等待connected信号...";
 }
 
 void BluetoothWorker::onServiceDiscoveryError(QBluetoothServiceDiscoveryAgent::Error error)
